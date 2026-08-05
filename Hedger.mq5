@@ -41,6 +41,9 @@ input double          InpTrimProfitPercent = 25.0;           // Profit Keep Perc
 input string          InpStartTime         = "00:00";        // Trading Start Time (HH:MM)
 input string          InpEndTime           = "23:59";        // Trading End Time (HH:MM)
 
+//--- Strategy Settings
+input bool            InpUseEMA            = true;              // Use EMA Signal for Initial Trade
+input ENUM_POSITION_TYPE InpStartDirection = POSITION_TYPE_BUY; // Trade Direction (If EMA is Disabled)
 input int             InpEMAFast           = 9;              // Fast EMA Period
 input int             InpEMASlow           = 21;             // Slow EMA Period
 input int             InpEMATrient         = 200;            // Trend EMA Period
@@ -51,12 +54,13 @@ input double          InpInitialBalance    = 10000.0;        // Initial Balance 
 input double          InpProfitTargetAmount= 100.0;          // Profit Target Amount ($)
 
 //--- Global Variables
-int  handle_ema_fast;
-int  handle_ema_slow;
-int  handle_ema_trend;
-bool is_waiting_for_signal = false;
-bool is_trimming_stuck     = false;
-bool is_manual_pause       = false;
+int    handle_ema_fast;
+int    handle_ema_slow;
+int    handle_ema_trend;
+bool   is_waiting_for_signal = false;
+bool   is_trimming_stuck     = false;
+bool   is_manual_pause       = false;
+double ActiveCycleBalance    = 0.0;  // Tracks balance to fix the initial amount bug
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
@@ -79,6 +83,14 @@ int OnInit()
      {
       is_waiting_for_signal = true;
       Print("Strategy Tester detected: Automatic signal scanning activated.");
+     }
+     
+   // Fix for the incorrect initial balance input bug
+   ActiveCycleBalance = InpInitialBalance;
+   if(AccountInfoDouble(ACCOUNT_EQUITY) > ActiveCycleBalance + InpProfitTargetAmount)
+     {
+      ActiveCycleBalance = AccountInfoDouble(ACCOUNT_EQUITY);
+      Print("Notice: Initial balance input was lower than equity. Auto-adjusted base balance to: ", ActiveCycleBalance);
      }
 
    // 1. Create Control Button
@@ -199,12 +211,16 @@ bool IsWithinTradingTime()
   }
 
 //+------------------------------------------------------------------+
-//| Monitors target equity requirements to trigger cash-outs        |
+//| Monitors target equity requirements to trigger cash-outs         |
 //+------------------------------------------------------------------+
 void CheckProfitTarget()
   {
+   // Guard: Only check profit targets if we actually have trades open to prevent infinite loop spam
+   if(!CheckActivePositions()) 
+      return;
+
    double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
-   double targetThreshold = InpInitialBalance + InpProfitTargetAmount;
+   double targetThreshold = ActiveCycleBalance + InpProfitTargetAmount;
 
    if(currentEquity >= targetThreshold)
      {
@@ -217,6 +233,9 @@ void CheckProfitTarget()
 
       CloseAll();
       is_waiting_for_signal = false;
+      
+      // Update baseline balance so next manual start calculates correctly
+      ActiveCycleBalance = AccountInfoDouble(ACCOUNT_EQUITY); 
       UpdateButtonState();
      }
   }
@@ -258,6 +277,26 @@ void InitialTrade()
       if(InpMaxLotPerSide > 0 && InpInitialLot > InpMaxLotPerSide) 
          return;
 
+      // Handle immediate trade placement if EMA is disabled
+      if(!InpUseEMA)
+        {
+         if(InpStartDirection == POSITION_TYPE_BUY)
+           {
+            double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+            trade.Buy(InpInitialLot, _Symbol, ask, 0, 0, "Initial Long (No EMA)");
+           }
+         else
+           {
+            double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+            trade.Sell(InpInitialLot, _Symbol, bid, 0, 0, "Initial Short (No EMA)");
+           }
+           
+         is_waiting_for_signal = false;
+         UpdateButtonState();
+         return;
+        }
+
+      // Handle trade placement based on EMA signal
       double fast_ema[], slow_ema[], trend_ema[];
 
       if(CopyBuffer(handle_ema_fast, 0, 0, 1, fast_ema) < 1 ||
