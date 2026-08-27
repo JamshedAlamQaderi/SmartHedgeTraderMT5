@@ -146,6 +146,7 @@ void OnTick()
       return; 
 
    // 0. Monitor global monetary milestones before executing calculations
+   CheckSinglePositionTP();
    CheckProfitTarget();
    UpdateButtonState();
 
@@ -179,6 +180,33 @@ void OnTick()
    // 5. Place inside hedge trade (Hedge automatically happen)
    ManageInsideHedge();
   }
+ 
+ void CheckSinglePositionTP()
+  {
+   if(PositionsTotal() != 1) return;
+
+   for(int i = 0; i < PositionsTotal(); i++)
+     {
+      if(PositionGetSymbol(i) == _Symbol)
+        {
+         ulong ticket       = PositionGetTicket(i);
+         long type          = PositionGetInteger(POSITION_TYPE);
+         double openPrice   = PositionGetDouble(POSITION_PRICE_OPEN);
+         double currentPrice= PositionGetDouble(POSITION_PRICE_CURRENT);
+         double pointsProfit= (type == POSITION_TYPE_BUY) ? (currentPrice - openPrice) : (openPrice - currentPrice);
+         pointsProfit /= _Point;
+
+         if(pointsProfit >= InpProfitTarget)
+           {
+            trade.PositionClose(ticket);
+            DeleteRebalanceOrders(); // Clean up pending hedge stop orders
+            is_waiting_for_signal = false;
+            UpdateButtonState();
+           }
+        }
+     }
+  }
+  
 
 //+------------------------------------------------------------------+
 //| Time filter assessment for trading hours                         |
