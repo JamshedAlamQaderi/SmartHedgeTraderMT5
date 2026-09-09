@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, Jamshed Alam Qaderi."
 #property link      "https://jamshedalamqaderi.com"
-#property version   "1.00"
+#property version   "1.20"
 
 //--- Include Trade Library
 #include <Trade\Trade.mqh>
@@ -38,22 +38,18 @@ input string             InpStartTime         = "00:00";           // Trading St
 input string             InpEndTime           = "23:59";           // Trading End Time (HH:MM)
 
 //--- Input Parameters: Strategy Settings
-input bool               InpUseEMA            = true;              // Use EMA Signal for Initial Trade
-input ENUM_POSITION_TYPE InpStartDirection    = POSITION_TYPE_BUY; // Trade Direction (If EMA is Disabled)
-input int                InpEMAFast           = 9;                 // Fast EMA Period
-input int                InpEMASlow           = 21;                // Slow EMA Period
-input int                InpEMATrient         = 200;               // Trend EMA Period
-input ENUM_TIMEFRAMES    InpEMATimeframe      = PERIOD_CURRENT;    // EMA Timeframe
+input ENUM_POSITION_TYPE InpStartDirection    = POSITION_TYPE_BUY; // Initial Trade Direction
+input ENUM_TIMEFRAMES    InpTimeframe         = PERIOD_CURRENT;    // Timeframe (For Inside Hedge Calculation)
 
 //--- Input Parameters: Target Monetary Settings
 input double             InpInitialBalance    = 10000.0;           // Initial Balance Setup
 input double             InpProfitTargetAmount= 100.0;             // Profit Target Amount ($)
 
-//--- Global Variables
-int          handle_ema_fast;
-int          handle_ema_slow;
-int          handle_ema_trend;
+//--- Input Parameters: Logging & Notifications
+input bool               InpEnableFileLog     = true;              // Save detailed daily logs to file for AI analysis
+input bool               InpEnablePushNotify  = true;              // Send Mobile Push Notifications for key events
 
+//--- Global Variables
 bool         is_waiting_for_signal = false;
 bool         is_trimming_stuck     = false;
 bool         is_manual_pause       = false;
@@ -63,26 +59,67 @@ PositionInfo profitableArray[];
 PositionInfo losingArray[];
 
 //+------------------------------------------------------------------+
+//| Structured Logger for AI Analysis & Debugging                    |
+//+------------------------------------------------------------------+
+void LogEvent(string level, string component, string message)
+{
+   string timestamp = TimeToString(TimeCurrent(), TIME_DATE | TIME_SECONDS);
+   double equity    = AccountInfoDouble(ACCOUNT_EQUITY);
+   double balance   = AccountInfoDouble(ACCOUNT_BALANCE);
+
+   string logLine = StringFormat("[%s] [%s] [%s] %s | Equity: %.2f | Balance: %.2f | OpenPos: %d",
+                                 timestamp, level, component, message, equity, balance, PositionsTotal());
+
+   // 1. Output to MT5 Terminal Experts tab
+   Print(logLine);
+
+   // 2. Output to daily file in MQL5/Files/ for AI diagnostic analysis
+   if(InpEnableFileLog)
+   {
+      MqlDateTime dt;
+      TimeToStruct(TimeCurrent(), dt);
+      string fileName = StringFormat("Hedger_Log_%04d-%02d-%02d.log", dt.year, dt.mon, dt.day);
+
+      int fileHandle = FileOpen(fileName, FILE_READ | FILE_WRITE | FILE_TXT | FILE_SHARE_READ | FILE_SHARE_WRITE);
+      if(fileHandle != INVALID_HANDLE)
+      {
+         FileSeek(fileHandle, 0, SEEK_END);
+         FileWriteString(fileHandle, logLine + "\r\n");
+         FileClose(fileHandle);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Centralized Alert & Mobile Push Notification Manager             |
+//+------------------------------------------------------------------+
+void SendEAAlert(string eventTitle, string message, bool pushNotify = true)
+{
+   string fullText = StringFormat("[%s - %s] %s: %s", _Symbol, EnumToString((ENUM_TIMEFRAMES)_Period), eventTitle, message);
+
+   LogEvent("NOTIFICATION", eventTitle, message);
+   // Alert(fullText); // Uncomment if you also want annoying desktop popups
+
+   if(InpEnablePushNotify && pushNotify)
+   {
+      if(!SendNotification(fullText))
+      {
+         LogEvent("WARNING", "Notification", "Failed to send push notification. Check MetaQuotes ID settings.");
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
 //| Expert initialization function                                   |
 //+------------------------------------------------------------------+
 int OnInit()
 {
    MathSrand(GetTickCount());
 
-   handle_ema_fast  = iMA(_Symbol, InpEMATimeframe, InpEMAFast, 0, MODE_EMA, PRICE_CLOSE);
-   handle_ema_slow  = iMA(_Symbol, InpEMATimeframe, InpEMASlow, 0, MODE_EMA, PRICE_CLOSE);
-   handle_ema_trend = iMA(_Symbol, InpEMATimeframe, InpEMATrient, 0, MODE_EMA, PRICE_CLOSE);
-
-   if(handle_ema_fast == INVALID_HANDLE || handle_ema_slow == INVALID_HANDLE || handle_ema_trend == INVALID_HANDLE)
-   {
-      Print("Failed to create handles for the indicators.");
-      return(INIT_FAILED);
-   }
-
    if(MQLInfoInteger(MQL_TESTER))
    {
       is_waiting_for_signal = true;
-      Print("Strategy Tester detected: Automatic signal scanning activated.");
+      LogEvent("INFO", "OnInit", "Strategy Tester detected: Automatic signal scanning activated.");
    }
 
    // Fix for the incorrect initial balance input bug
@@ -90,13 +127,13 @@ int OnInit()
    if(AccountInfoDouble(ACCOUNT_EQUITY) > ActiveCycleBalance + InpProfitTargetAmount)
    {
       ActiveCycleBalance = AccountInfoDouble(ACCOUNT_EQUITY);
-      Print("Notice: Initial balance input was lower than equity. Auto-adjusted base balance to: ", ActiveCycleBalance);
+      LogEvent("INFO", "OnInit", StringFormat("Initial balance adjusted to equity: %.2f", ActiveCycleBalance));
    }
 
    // 1. Create Control Button
    if(!ObjectCreate(0, BUTTON_NAME, OBJ_BUTTON, 0, 0, 0))
    {
-      Print("Failed to create the Start/Stop button.");
+      LogEvent("ERROR", "OnInit", "Failed to create Start/Stop button.");
       return(INIT_FAILED);
    }
    ObjectSetInteger(0, BUTTON_NAME, OBJPROP_XDISTANCE, 20);
@@ -109,17 +146,18 @@ int OnInit()
    // 2. Create Pause/Resume Button
    if(!ObjectCreate(0, BUTTON_PAUSE, OBJ_BUTTON, 0, 0, 0))
    {
-      Print("Failed to create the Pause button.");
+      LogEvent("ERROR", "OnInit", "Failed to create Pause button.");
       return(INIT_FAILED);
    }
    ObjectSetInteger(0, BUTTON_PAUSE, OBJPROP_XDISTANCE, 20);
-   ObjectSetInteger(0, BUTTON_PAUSE, OBJPROP_YDISTANCE, 60); // Placed slightly below the first button
+   ObjectSetInteger(0, BUTTON_PAUSE, OBJPROP_YDISTANCE, 60);
    ObjectSetInteger(0, BUTTON_PAUSE, OBJPROP_XSIZE, 100);
    ObjectSetInteger(0, BUTTON_PAUSE, OBJPROP_YSIZE, 30);
    ObjectSetInteger(0, BUTTON_PAUSE, OBJPROP_CORNER, CORNER_LEFT_UPPER);
    ObjectSetInteger(0, BUTTON_PAUSE, OBJPROP_SELECTABLE, false);
 
    UpdateButtonState();
+   LogEvent("INFO", "OnInit", "Hedger EA Initialized successfully (Manual Mode Only).");
 
    return(INIT_SUCCEEDED);
 }
@@ -129,11 +167,9 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   IndicatorRelease(handle_ema_fast);
-   IndicatorRelease(handle_ema_slow);
-   IndicatorRelease(handle_ema_trend);
    ObjectDelete(0, BUTTON_NAME);
    ObjectDelete(0, BUTTON_PAUSE);
+   LogEvent("INFO", "OnDeinit", StringFormat("EA Deinitialized. Reason code: %d", reason));
 }
 
 //+------------------------------------------------------------------+
@@ -168,7 +204,6 @@ void OnTick()
          RebalanceHedgeV2();
          SqueezeHedgeOrders();
       }
-      // If fully balanced or no positions exist, stay paused out of hours
       return;
    }
 
@@ -180,7 +215,7 @@ void OnTick()
    SqueezeHedgeOrders();
    // 4. Trimming the positions
    ManageTrimming();
-   // 5. Place inside hedge trade (Hedge automatically happen)
+   // 5. Place inside hedge trade
    ManageInsideHedge();
 }
 
@@ -199,16 +234,22 @@ void CheckSinglePositionTP()
          long type           = PositionGetInteger(POSITION_TYPE);
          double openPrice    = PositionGetDouble(POSITION_PRICE_OPEN);
          double currentPrice = PositionGetDouble(POSITION_PRICE_CURRENT);
+         double profitMoney  = PositionGetDouble(POSITION_PROFIT);
          double pointsProfit = (type == POSITION_TYPE_BUY) ? (currentPrice - openPrice) : (openPrice - currentPrice);
-         
+
          pointsProfit /= _Point;
 
          if(pointsProfit >= InpProfitTarget)
          {
-            trade.PositionClose(ticket);
-            DeleteRebalanceOrders(); // Clean up pending hedge stop orders
-            is_waiting_for_signal = false;
-            UpdateButtonState();
+            if(trade.PositionClose(ticket))
+            {
+               DeleteRebalanceOrders();
+               is_waiting_for_signal = false;
+               UpdateButtonState();
+
+               string msg = StringFormat("Single Position TP Hit! Ticket #%I64u Closed. Points: %.0f | Profit: $%.2f", ticket, pointsProfit, profitMoney);
+               SendEAAlert("Single Position TP", msg, true);
+            }
          }
       }
    }
@@ -238,11 +279,10 @@ bool IsWithinTradingTime()
    }
    else if(startMins > endMins)
    {
-      // Crosses midnight
       return (currentMins >= startMins || currentMins < endMins);
    }
 
-   return true; // If they are identical (e.g., 00:00 to 00:00), assume 24h trading
+   return true;
 }
 
 //+------------------------------------------------------------------+
@@ -250,7 +290,6 @@ bool IsWithinTradingTime()
 //+------------------------------------------------------------------+
 void CheckProfitTarget()
 {
-   // Guard: Only check profit targets if we actually have trades open to prevent infinite loop spam
    if(!CheckActivePositions()) return;
 
    double currentEquity   = AccountInfoDouble(ACCOUNT_EQUITY);
@@ -258,17 +297,13 @@ void CheckProfitTarget()
 
    if(currentEquity >= targetThreshold)
    {
-      string targetAlert = "[HedgeEA Target Achieved] Profit Milestone Hit! Equity: " +
-                           DoubleToString(currentEquity, 2) + " >= Target: " + DoubleToString(targetThreshold, 2);
+      string msg = StringFormat("Profit Target Milestone Reached! Equity: $%.2f >= Target: $%.2f. Closing all positions & pausing bot.",
+                                currentEquity, targetThreshold);
 
-      Print(targetAlert);
-      Alert(targetAlert);
-      SendNotification(targetAlert);
+      SendEAAlert("Global Target Achieved", msg, true);
 
       CloseAll();
       is_waiting_for_signal = false;
-
-      // Update baseline balance so next manual start calculates correctly
       ActiveCycleBalance = AccountInfoDouble(ACCOUNT_EQUITY);
       UpdateButtonState();
    }
@@ -279,13 +314,16 @@ void CheckProfitTarget()
 //+------------------------------------------------------------------+
 void CloseAll()
 {
+   int pendingDeleted = 0;
+   int positionsClosed = 0;
+
    // 1. Remove all active pending orders for this specific symbol
    for(int i = OrdersTotal() - 1; i >= 0; i--)
    {
       ulong ticket = OrderGetTicket(i);
       if(ticket > 0 && OrderGetString(ORDER_SYMBOL) == _Symbol)
       {
-         trade.OrderDelete(ticket);
+         if(trade.OrderDelete(ticket)) pendingDeleted++;
       }
    }
 
@@ -295,9 +333,11 @@ void CloseAll()
       ulong ticket = PositionGetTicket(i);
       if(ticket > 0 && PositionGetString(POSITION_SYMBOL) == _Symbol)
       {
-         trade.PositionClose(ticket);
+         if(trade.PositionClose(ticket)) positionsClosed++;
       }
    }
+
+   LogEvent("ACTION", "CloseAll", StringFormat("Closed %d positions and deleted %d pending orders.", positionsClosed, pendingDeleted));
 }
 
 //+------------------------------------------------------------------+
@@ -307,55 +347,26 @@ void InitialTrade()
 {
    if(is_waiting_for_signal && !CheckActivePositions())
    {
-      // Optional safety cap for initial trade
       if(InpMaxLotPerSide > 0 && InpInitialLot > InpMaxLotPerSide) return;
 
-      // Handle immediate trade placement if EMA is disabled
-      if(!InpUseEMA)
+      if(InpStartDirection == POSITION_TYPE_BUY)
       {
-         if(InpStartDirection == POSITION_TYPE_BUY)
-         {
-            double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-            trade.Buy(InpInitialLot, _Symbol, ask, 0, 0, "Initial Long (No EMA)");
-         }
-         else
-         {
-            double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-            trade.Sell(InpInitialLot, _Symbol, bid, 0, 0, "Initial Short (No EMA)");
-         }
-
-         is_waiting_for_signal = false;
-         UpdateButtonState();
-         return;
-      }
-
-      // Handle trade placement based on EMA signal
-      double fast_ema[], slow_ema[], trend_ema[];
-
-      if(CopyBuffer(handle_ema_fast, 0, 0, 1, fast_ema) < 1 ||
-         CopyBuffer(handle_ema_slow, 0, 0, 1, slow_ema) < 1 ||
-         CopyBuffer(handle_ema_trend, 0, 0, 1, trend_ema) < 1)
-      {
-         return;
-      }
-
-      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-
-      if(ask > fast_ema[0] && fast_ema[0] > slow_ema[0] && slow_ema[0] > trend_ema[0])
-      {
+         double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
          if(trade.Buy(InpInitialLot, _Symbol, ask, 0, 0, "Initial Long"))
          {
             is_waiting_for_signal = false;
             UpdateButtonState();
+            SendEAAlert("Initial Trade Opened", StringFormat("BUY %.2f @ %.5f", InpInitialLot, ask), true);
          }
       }
-      else if(bid < fast_ema[0] && fast_ema[0] < slow_ema[0] && slow_ema[0] < trend_ema[0])
+      else
       {
+         double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
          if(trade.Sell(InpInitialLot, _Symbol, bid, 0, 0, "Initial Short"))
          {
             is_waiting_for_signal = false;
             UpdateButtonState();
+            SendEAAlert("Initial Trade Opened", StringFormat("SELL %.2f @ %.5f", InpInitialLot, bid), true);
          }
       }
    }
@@ -373,16 +384,16 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
       {
          ObjectSetInteger(0, BUTTON_NAME, OBJPROP_STATE, false);
 
-         // If EA is running, turn it OFF and close all
          if(CheckActivePositions() || is_waiting_for_signal)
          {
             is_waiting_for_signal = false;
             CloseAll();
+            SendEAAlert("Bot Stopped", "User manually pressed STOP button. Closed all positions & cancelled orders.", true);
          }
          else
          {
-            // If completely idle, turn it ON
             is_waiting_for_signal = true;
+            SendEAAlert("Bot Started", "User manually pressed START button. Executing trade.", true);
          }
          UpdateButtonState();
       }
@@ -393,6 +404,9 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
          ObjectSetInteger(0, BUTTON_PAUSE, OBJPROP_STATE, false);
          is_manual_pause = !is_manual_pause;
          UpdateButtonState();
+
+         string pauseState = is_manual_pause ? "Bot PAUSED by user." : "Bot RESUMED by user.";
+         SendEAAlert("Bot Pause State Changed", pauseState, true);
       }
    }
 }
@@ -421,10 +435,7 @@ void UpdateButtonState()
 {
    bool has_position = CheckActivePositions();
 
-   // Start/Stop Button update
    ObjectSetString(0, BUTTON_NAME, OBJPROP_TEXT, (has_position || is_waiting_for_signal) ? "Stop" : "Start");
-
-   // Pause/Resume Button update
    ObjectSetString(0, BUTTON_PAUSE, OBJPROP_TEXT, is_manual_pause ? "Resume" : "Pause");
 
    ChartRedraw();
@@ -442,12 +453,11 @@ void RebalanceHedgeV2()
 
    double newVolume = NormalizeDouble(totalBuyLots - totalSellLots, 2);
 
-   PrintFormat("[RebalanceHedgeV2] Open positions imbalance: %.2f (Buy: %.2f | Sell: %.2f)", newVolume, totalBuyLots, totalSellLots);
+   LogEvent("DEBUG", "RebalanceHedgeV2", StringFormat("Imbalance: %.2f (Buy: %.2f | Sell: %.2f)", newVolume, totalBuyLots, totalSellLots));
 
    // 1. Balance Check
    if(newVolume == 0.0)
    {
-      Print("[RebalanceHedgeV2] Grid is perfectly balanced. Deleting lingering rebalance orders and exiting.");
       DeleteRebalanceOrders();
       return;
    }
@@ -455,24 +465,17 @@ void RebalanceHedgeV2()
    // 2. Direction and Base Lot Calculation
    ENUM_POSITION_TYPE requiredType   = (newVolume > 0.0) ? POSITION_TYPE_SELL : POSITION_TYPE_BUY;
    ENUM_ORDER_TYPE requiredOrderType = (requiredType == POSITION_TYPE_BUY) ? ORDER_TYPE_BUY_STOP : ORDER_TYPE_SELL_STOP;
-   string typeStr                    = (requiredType == POSITION_TYPE_BUY) ? "BUY_STOP" : "SELL_STOP";
 
    double requiredLot = CalculateRequiredLotForRebalance(MathAbs(newVolume), requiredType);
-   PrintFormat("[RebalanceHedgeV2] Direction: %s | Base Required Lot: %.2f", typeStr, requiredLot);
 
-   // 3. Max Side Cap Validation (Only apply if InpMaxLotPerSide > 0)
+   // 3. Max Side Cap Validation
    if(InpMaxLotPerSide > 0.0)
    {
       double currentSideExposure   = (requiredType == POSITION_TYPE_BUY) ? totalBuyOrdersLot : totalSellOrdersLot;
       double remainingEligibleLots = NormalizeDouble(InpMaxLotPerSide - currentSideExposure, 2);
-
-      PrintFormat("[RebalanceHedgeV2] Side Exposure limit check -> Max Allowed: %.2f | Current: %.2f | Remaining Eligible: %.2f",
-                  InpMaxLotPerSide, currentSideExposure, remainingEligibleLots);
-
       requiredLot = MathMin(remainingEligibleLots, requiredLot);
    }
 
-   // Normalize lot size to broker volume step
    double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
    double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    requiredLot    = MathFloor(requiredLot / lotStep) * lotStep;
@@ -480,17 +483,16 @@ void RebalanceHedgeV2()
    // 4. Minimum Lot Check
    if(requiredLot < minLot)
    {
-      PrintFormat("[RebalanceHedgeV2] Adjusted required lot (%.2f) is below minimum broker lot (%.2f). Execution aborted.", requiredLot, minLot);
+      LogEvent("WARNING", "RebalanceHedgeV2", StringFormat("Required lot %.2f below broker minimum %.2f", requiredLot, minLot));
       return;
    }
 
-   // 5. Scan order book for any existing Buy Stop or Sell Stop order on this symbol
+   // 5. Scan order book for existing pending orders
    ulong pendingTicket = 0;
    ENUM_ORDER_TYPE pendingType = WRONG_VALUE;
    double pendingLots = 0.0;
 
-   int totalOrders = OrdersTotal();
-   for(int i = totalOrders - 1; i >= 0; i--)
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
    {
       ulong ticket = OrderGetTicket(i);
       if(ticket > 0 && OrderGetString(ORDER_SYMBOL) == _Symbol)
@@ -511,31 +513,33 @@ void RebalanceHedgeV2()
    {
       if(pendingType == requiredOrderType && NormalizeDouble(pendingLots, 2) == NormalizeDouble(requiredLot, 2))
       {
-         PrintFormat("[RebalanceHedgeV2] Correct pending order already exists (Ticket: %I64u | Vol: %.2f). No action needed.", pendingTicket, pendingLots);
          return;
       }
       else
       {
-         PrintFormat("[RebalanceHedgeV2] Existing order mismatch (Type: %d vs Required: %d | Vol: %.2f vs Required: %.2f). Deleting ticket %I64u.",
-                     pendingType, requiredOrderType, pendingLots, requiredLot, pendingTicket);
          trade.OrderDelete(pendingTicket);
+         LogEvent("ACTION", "RebalanceHedgeV2", StringFormat("Deleted existing mismatched order #%I64u", pendingTicket));
       }
    }
 
-   // 7. Execute clean rebalance order placement
+   // 7. Execute rebalance order placement
    double offset = InpHedgeDistance * _Point;
 
    if(requiredType == POSITION_TYPE_BUY)
    {
       double buyPrice = NormalizeDouble(SymbolInfoDouble(_Symbol, SYMBOL_ASK) + offset, _Digits);
-      PrintFormat("[RebalanceHedgeV2] Executing: BUY_STOP | Vol: %.2f | Price: %.5f", requiredLot, buyPrice);
-      trade.BuyStop(requiredLot, buyPrice, _Symbol, 0, 0, ORDER_TIME_GTC, 0, "Hedge Rebalance");
+      if(trade.BuyStop(requiredLot, buyPrice, _Symbol, 0, 0, ORDER_TIME_GTC, 0, "Hedge Rebalance"))
+      {
+         LogEvent("ACTION", "RebalanceHedgeV2", StringFormat("Placed BUY_STOP Vol: %.2f @ %.5f", requiredLot, buyPrice));
+      }
    }
    else
    {
       double sellPrice = NormalizeDouble(SymbolInfoDouble(_Symbol, SYMBOL_BID) - offset, _Digits);
-      PrintFormat("[RebalanceHedgeV2] Executing: SELL_STOP | Vol: %.2f | Price: %.5f", requiredLot, sellPrice);
-      trade.SellStop(requiredLot, sellPrice, _Symbol, 0, 0, ORDER_TIME_GTC, 0, "Hedge Rebalance");
+      if(trade.SellStop(requiredLot, sellPrice, _Symbol, 0, 0, ORDER_TIME_GTC, 0, "Hedge Rebalance"))
+      {
+         LogEvent("ACTION", "RebalanceHedgeV2", StringFormat("Placed SELL_STOP Vol: %.2f @ %.5f", requiredLot, sellPrice));
+      }
    }
 }
 
@@ -562,9 +566,8 @@ void SqueezeHedgeOrders()
    int totalOrders = OrdersTotal();
    if(totalOrders == 0) return;
 
-   // Fetch inner boundaries
-   double lastBuyLevel  = GetLastPositionPrice(POSITION_TYPE_BUY);  // Bottom Buy
-   double lastSellLevel = GetLastPositionPrice(POSITION_TYPE_SELL); // Top Sell
+   double lastBuyLevel  = GetLastPositionPrice(POSITION_TYPE_BUY);
+   double lastSellLevel = GetLastPositionPrice(POSITION_TYPE_SELL);
 
    double ask    = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid    = SymbolInfoDouble(_Symbol, SYMBOL_BID);
@@ -573,15 +576,12 @@ void SqueezeHedgeOrders()
    for(int i = totalOrders - 1; i >= 0; i--)
    {
       ulong ticket = OrderGetTicket(i);
-
-      // Guard Clause: Instantly skip irrelevant orders to flatten code indentation
       if(ticket <= 0 || OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
 
       ENUM_ORDER_TYPE type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
       double open_price    = OrderGetDouble(ORDER_PRICE_OPEN);
       double target_price  = 0.0;
 
-      //--- 1. Handle protective Sell Stops
       if(type == ORDER_TYPE_SELL_STOP)
       {
          target_price = bid - offset;
@@ -590,10 +590,12 @@ void SqueezeHedgeOrders()
          target_price = NormalizeDouble(target_price, _Digits);
          if(target_price > open_price)
          {
-            trade.OrderModify(ticket, target_price, 0, 0, ORDER_TIME_GTC, 0);
+            if(trade.OrderModify(ticket, target_price, 0, 0, ORDER_TIME_GTC, 0))
+            {
+               LogEvent("ACTION", "SqueezeHedge", StringFormat("Squeezed SELL_STOP #%I64u to %.5f", ticket, target_price));
+            }
          }
       }
-      //--- 2. Handle protective Buy Stops
       else if(type == ORDER_TYPE_BUY_STOP)
       {
          target_price = ask + offset;
@@ -602,7 +604,10 @@ void SqueezeHedgeOrders()
          target_price = NormalizeDouble(target_price, _Digits);
          if(target_price < open_price)
          {
-            trade.OrderModify(ticket, target_price, 0, 0, ORDER_TIME_GTC, 0);
+            if(trade.OrderModify(ticket, target_price, 0, 0, ORDER_TIME_GTC, 0))
+            {
+               LogEvent("ACTION", "SqueezeHedge", StringFormat("Squeezed BUY_STOP #%I64u to %.5f", ticket, target_price));
+            }
          }
       }
    }
@@ -615,14 +620,12 @@ void ManageTrimming()
 {
    if(ArraySize(profitableArray) == 0 || ArraySize(losingArray) == 0) return;
 
-   //--- 2. Calculate dynamic pool aggregation requirements
    double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
    double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
 
    int profToUse    = 0;
    double poolMoney = 0.0;
 
-   // Iteratively pool profitable positions until we can afford the minimum lot change
    for(int p = 0; p < ArraySize(profitableArray); p++)
    {
       profToUse++;
@@ -630,10 +633,7 @@ void ManageTrimming()
 
       double potentialLots = losingArray[0].volume * (poolMoney / losingArray[0].profit);
       potentialLots = MathFloor(potentialLots / lotStep) * lotStep;
-      
-      printf("Pool money: %.2f & Lossing Pos Loss: %.2f Potential lots: %.2f", poolMoney, losingArray[0].profit, potentialLots);
-      
-      // Stop pooling if the current single or combined credit satisfies the minimum execution volume
+
       if(potentialLots >= minLot || poolMoney >= losingArray[0].profit) break;
    }
 
@@ -642,20 +642,18 @@ void ManageTrimming()
 
    if(finalPotentialLots < minLot && poolMoney < losingArray[0].profit) return;
 
-   //--- 3. Execute the compound trimming sequence
    double actualPoolMoney = 0.0;
 
-   // Close only the targeted number of profitable positions required for this operation
    for(int p = 0; p < profToUse; p++)
    {
       double exactProfit = profitableArray[p].profit;
       if(trade.PositionClose(profitableArray[p].ticket))
       {
          actualPoolMoney += exactProfit * (1.0 - (InpTrimProfitPercent / 100.0));
+         LogEvent("ACTION", "Trimming", StringFormat("Closed Profitable Position #%I64u (Profit: $%.2f)", profitableArray[p].ticket, exactProfit));
       }
    }
 
-   // Cascade the collected pool balance to shave or close the losing array positions
    for(int k = 0; k < ArraySize(losingArray); k++)
    {
       if(actualPoolMoney <= 0) break;
@@ -665,6 +663,7 @@ void ManageTrimming()
          if(trade.PositionClose(losingArray[k].ticket))
          {
             actualPoolMoney -= losingArray[k].profit;
+            LogEvent("ACTION", "Trimming", StringFormat("Fully Covered & Closed Losing Position #%I64u", losingArray[k].ticket));
          }
       }
       else
@@ -675,7 +674,10 @@ void ManageTrimming()
          if(closeLots < minLot) closeLots = minLot;
          if(closeLots > losingArray[k].volume) closeLots = losingArray[k].volume;
 
-         trade.PositionClosePartial(losingArray[k].ticket, closeLots);
+         if(trade.PositionClosePartial(losingArray[k].ticket, closeLots))
+         {
+            LogEvent("ACTION", "Trimming", StringFormat("Partially Trimmed Losing Position #%I64u by %.2f Lots", losingArray[k].ticket, closeLots));
+         }
          break;
       }
    }
@@ -693,15 +695,14 @@ void ManageInsideHedge()
 
    double minDistance = InpProfitTarget * GAP_MULTIPLIER * _Point;
    double distance    = NormalizeDouble(bottomBuy - topSell, _Digits);
-   
+
    if(distance < minDistance) return;
 
-   // Request bar history for the defined indicator timeframe
    MqlRates rates[];
    ArraySetAsSeries(rates, true);
-   if(CopyRates(_Symbol, InpEMATimeframe, 0, 2, rates) < 2) return;
+   
+   if(CopyRates(_Symbol, InpTimeframe, 0, 2, rates) < 2) return;
 
-   // Guard Clause: Only evaluate and execute once per new candle open
    static datetime lastProcessedBar = 0;
    if(rates[0].time == lastProcessedBar) return;
 
@@ -711,37 +712,35 @@ void ManageInsideHedge()
    double candleOpen  = rates[1].open;
    double candleClose = rates[1].close;
 
-   //--- 1. Inside Buy Trigger: Candle opened below and closed above EITHER point
    bool crossUpLower = (candleOpen < lowerTradePoint && candleClose > lowerTradePoint);
    bool crossUpUpper = (candleOpen < upperTradePoint && candleClose > upperTradePoint);
 
    if(crossUpLower || crossUpUpper)
    {
-      // Verify Side Limit before placing Inside Hedge Buy
       if(InpMaxLotPerSide == 0 || (GetTotalVolume(POSITION_TYPE_BUY, false) + InpInitialLot <= InpMaxLotPerSide))
       {
          double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
          if(trade.Buy(InpInitialLot, _Symbol, ask, 0, 0, "Inside Hedge Buy"))
          {
             lastProcessedBar = rates[0].time;
+            SendEAAlert("Inside Hedge Executed", StringFormat("BUY %.2f @ %.5f", InpInitialLot, ask), true);
          }
       }
       return;
    }
 
-   //--- 2. Inside Sell Trigger: Candle opened above and closed below EITHER point
    bool crossDownLower = (candleOpen > lowerTradePoint && candleClose < lowerTradePoint);
    bool crossDownUpper = (candleOpen > upperTradePoint && candleClose < upperTradePoint);
 
    if(crossDownLower || crossDownUpper)
    {
-      // Verify Side Limit before placing Inside Hedge Sell
       if(InpMaxLotPerSide == 0 || (GetTotalVolume(POSITION_TYPE_SELL, false) + InpInitialLot <= InpMaxLotPerSide))
       {
          double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
          if(trade.Sell(InpInitialLot, _Symbol, bid, 0, 0, "Inside Hedge Sell"))
          {
             lastProcessedBar = rates[0].time;
+            SendEAAlert("Inside Hedge Executed", StringFormat("SELL %.2f @ %.5f", InpInitialLot, bid), true);
          }
       }
    }
@@ -754,7 +753,6 @@ double GetTotalVolume(ENUM_POSITION_TYPE type, bool withOrders = true)
 {
    double total_volume = 0.0;
 
-   //--- 1. Calculate Open Positions Volume for current symbol
    for(int i = 0; i < PositionsTotal(); i++)
    {
       if(PositionGetSymbol(i) == _Symbol)
@@ -765,10 +763,9 @@ double GetTotalVolume(ENUM_POSITION_TYPE type, bool withOrders = true)
          }
       }
    }
-   
+
    if(!withOrders) return NormalizeDouble(total_volume, 2);
 
-   //--- 2. Calculate Pending Orders Volume for current symbol
    int total_orders = OrdersTotal();
    for(int i = 0; i < total_orders; i++)
    {
@@ -777,7 +774,6 @@ double GetTotalVolume(ENUM_POSITION_TYPE type, bool withOrders = true)
       {
          ENUM_ORDER_TYPE order_type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
 
-         // Accumulate matching buy-intent orders
          if(type == POSITION_TYPE_BUY)
          {
             if(order_type == ORDER_TYPE_BUY_LIMIT || order_type == ORDER_TYPE_BUY_STOP)
@@ -785,7 +781,6 @@ double GetTotalVolume(ENUM_POSITION_TYPE type, bool withOrders = true)
                total_volume += OrderGetDouble(ORDER_VOLUME_CURRENT);
             }
          }
-         // Accumulate matching sell-intent orders
          else if(type == POSITION_TYPE_SELL)
          {
             if(order_type == ORDER_TYPE_SELL_LIMIT || order_type == ORDER_TYPE_SELL_STOP)
@@ -796,7 +791,6 @@ double GetTotalVolume(ENUM_POSITION_TYPE type, bool withOrders = true)
       }
    }
 
-   // Return volume rounded cleanly to broker micro-lot specifications
    return NormalizeDouble(total_volume, 2);
 }
 
@@ -808,7 +802,6 @@ double GetLastPositionPrice(ENUM_POSITION_TYPE type, bool includeOrders = false)
    double extreme_price = 0.0;
    bool tracking_initialized = false;
 
-   //--- 1. Scan Open Positions
    int total_positions = PositionsTotal();
    for(int i = 0; i < total_positions; i++)
    {
@@ -820,7 +813,6 @@ double GetLastPositionPrice(ENUM_POSITION_TYPE type, bool includeOrders = false)
       tracking_initialized = true;
    }
 
-   //--- 2. Scan Pending Orders (Skipped if includeOrders is false)
    if(includeOrders)
    {
       int total_orders = OrdersTotal();
@@ -853,7 +845,6 @@ void SyncPositionArrays()
 
    int totalPositions = PositionsTotal();
 
-   //--- 1. Gather and sort all qualifying profitable and losing positions
    for(int i = 0; i < totalPositions; i++)
    {
       if(PositionGetSymbol(i) != _Symbol) continue;
@@ -893,10 +884,8 @@ void SyncPositionArrays()
       }
    }
 
-   // Guard Clause: Exit instantly if we don't have matching assets on both sides
    if(ArraySize(profitableArray) == 0 || ArraySize(losingArray) == 0) return;
 
-   // Sort profitable array by money generated (descending)
    for(int m = 0; m < ArraySize(profitableArray) - 1; m++)
    {
       for(int n = m + 1; n < ArraySize(profitableArray); n++)
@@ -910,7 +899,6 @@ void SyncPositionArrays()
       }
    }
 
-   // Sort losing array by grid distance (descending)
    for(int m = 0; m < ArraySize(losingArray) - 1; m++)
    {
       for(int n = m + 1; n < ArraySize(losingArray); n++)
@@ -926,18 +914,12 @@ void SyncPositionArrays()
 }
 
 //+------------------------------------------------------------------+
-//| Calculates the required lot size for rebalancing with logging    |
+//| Calculates the required lot size for rebalancing                 |
 //+------------------------------------------------------------------+
 double CalculateRequiredLotForRebalance(double diffVolume, ENUM_POSITION_TYPE rebalanceSide)
 {
-   PrintFormat("[CalculateRequiredLot] Started calculation. Input diffVolume: %.2f", diffVolume);
+   if(ArraySize(losingArray) == 0) return diffVolume;
 
-   if(ArraySize(losingArray) == 0)
-   {
-      Print("[CalculateRequiredLot] losingArray is empty. Returning input diffVolume: ", diffVolume);
-      return diffVolume;
-   }
-   
    int posIndex = -1;
    for(int i = 0; i < ArraySize(losingArray); i++)
    {
@@ -950,34 +932,23 @@ double CalculateRequiredLotForRebalance(double diffVolume, ENUM_POSITION_TYPE re
    }
 
    if(posIndex < 0) return diffVolume;
-   
+
    PositionInfo farLosingPos = losingArray[posIndex];
    double minRequiredDistanceToClose = farLosingPos.distance + (InpHedgeDistance * _Point);
    double remaingDistancePercent = 1.0 - (InpTrimProfitPercent / 100.0);
    double diffVolumeProfitDistance = (diffVolume * 100.0) * (InpProfitTarget * _Point) * remaingDistancePercent;
 
-   PrintFormat("[CalculateRequiredLot] Far Loss Distance: %.5f | Retained Profit Pct: %.2f | DiffVol Profit Dist: %.5f",
-               minRequiredDistanceToClose, remaingDistancePercent, diffVolumeProfitDistance);
-
    if(minRequiredDistanceToClose < diffVolumeProfitDistance)
    {
-      PrintFormat("[CalculateRequiredLot] minRequiredDistance (%.5f) < diffVolProfitDistance (%.5f). Returning diffVolume: %.2f",
-                  minRequiredDistanceToClose, diffVolumeProfitDistance, diffVolume);
       return diffVolume;
    }
 
    double initialLotProfitDistance = (InpInitialLot * 100.0) * (InpProfitTarget * _Point) * remaingDistancePercent;
-   PrintFormat("[CalculateRequiredLot] InitialLot Profit Dist: %.5f", initialLotProfitDistance);
 
    if(minRequiredDistanceToClose < initialLotProfitDistance)
    {
-      PrintFormat("[CalculateRequiredLot] minRequiredDistance (%.5f) < initialLotProfitDistance (%.5f). Returning InpInitialLot: %.2f",
-                  minRequiredDistanceToClose, initialLotProfitDistance, InpInitialLot);
       return InpInitialLot;
    }
-
-   // double calculatedLot = NormalizeDouble((minRequiredDistanceToClose / (InpProfitTarget * _Point * remaingDistancePercent)) / 100.0, 2);
-   // PrintFormat("[CalculateRequiredLot] Max distance threshold reached. Returning calculated scaled lot: %.2f", calculatedLot);
 
    return InpInitialLot;
 }
