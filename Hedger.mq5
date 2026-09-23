@@ -14,7 +14,7 @@ CTrade trade;
 //--- Object and Macro Definitions
 #define BUTTON_NAME    "EA_Control_Button"
 #define BUTTON_PAUSE   "EA_Pause_Button"
-#define GAP_MULTIPLIER 3 // Macro for the inside hedge gap multiplier
+#define GAP_MULTIPLIER 5 // Macro for the inside hedge gap multiplier
 
 struct PositionInfo
   {
@@ -728,8 +728,9 @@ void ManageInsideHedge()
    if(rates[0].time == lastProcessedBar)
       return;
 
-   double upperTradePoint = NormalizeDouble(bottomBuy - (minDistance / 2), _Digits);
-   double lowerTradePoint = NormalizeDouble(topSell + (minDistance / 2), _Digits);
+   double middleDistance  = NormalizeDouble(minDistance / 2, _Digits);
+   double upperTradePoint = NormalizeDouble(bottomBuy - middleDistance, _Digits);
+   double lowerTradePoint = NormalizeDouble(topSell + middleDistance, _Digits);
 
    double candleOpen  = rates[1].open;
    double candleClose = rates[1].close;
